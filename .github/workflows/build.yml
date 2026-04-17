@@ -7,23 +7,20 @@ jobs:
     runs-on: [self-hosted, proxmox]
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            pip-${{ runner.os }}-
-
-      - name: Setup venv smart
-        run: |
-          if [ ! -d "venv" ]; then
-            python3 -m venv venv
-          fi
-          ./venv/bin/pip install -r requirements.txt
-
-      - name: Restart API
-        run: |
-          systemctl restart homelab-api
+          - name: Pull latest code
+            run: |
+              cd /root/homelab-ai
+              git fetch origin
+              git reset --hard origin/main
+    
+          - name: Install deps (if needed)
+            run: |
+              cd /root/homelab-ai
+              if [ ! -d "venv" ]; then
+                python3 -m venv venv
+              fi
+              ./venv/bin/pip install --no-cache-dir -r requirements.txt
+    
+          - name: Restart API
+            run: |
+              systemctl restart homelab-api
