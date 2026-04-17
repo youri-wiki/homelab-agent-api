@@ -1,8 +1,10 @@
 import os
+
 import requests
+from duckduckgo_search import DDGS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from duckduckgo_search import DDGS
+
 from db import collection
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
@@ -121,7 +123,9 @@ def generate_answer(question: str, use_web: bool = True, n_results: int = 5):
     retrieved = query_knowledge(question, n_results=n_results)
 
     relevant_local = [
-        x for x in retrieved if x.get("distance") is None or x["distance"] <= MAX_ACCEPTED_DISTANCE
+        x
+        for x in retrieved
+        if x.get("distance") is None or x["distance"] <= MAX_ACCEPTED_DISTANCE
     ]
 
     local_context = _format_local_context(relevant_local) if relevant_local else ""
@@ -149,7 +153,7 @@ Behavior rules:
 6) Keep answers practical and concise.
 
 Return format:
-- Short answer
+- Short answers
 - Why / key facts used
 - Optional recommendation (if relevant)
 
