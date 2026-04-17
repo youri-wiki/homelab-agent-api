@@ -1,0 +1,1 @@
+  API made with RAG to communicate with OLLAMA local model.
