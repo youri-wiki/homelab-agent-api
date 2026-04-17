@@ -24,5 +24,6 @@ jobs:
           fi
           ./venv/bin/pip install -r requirements.txt
 
-      - name: Run app
-        run: ./venv/bin/python main.py
+      - name: Restart API
+        run: |
+          systemctl restart homelab-api
