@@ -9,11 +9,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python venv
+      - name: Fix temp dir
         run: |
+          export TMPDIR=$PWD/tmp
+          mkdir -p $TMPDIR
           python3 -m venv venv
-          source venv/bin/activate
-          pip install -r requirements.txt
+          ./venv/bin/pip install --no-cache-dir -r requirements.txt
 
       - name: Run app
         run: |
