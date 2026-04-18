@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Optional
 
@@ -129,134 +130,7 @@ def _format_web_context(items):
     return "\n\n".join(lines)
 
 
-# -----------------------------
-# Provider implementations
-# -----------------------------
-def _call_ollama(model: str, prompt: str) -> str:
-    response = HTTP.post(
-        OLLAMA_URL,
-        json={"model": model, "prompt": prompt, "stream": False},
-        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("response", "").strip()
-
-
-def _normalize_airllm_output(result) -> str:
-    """
-    AirLLM outputs can vary depending on version/backends.
-    Handle common shapes defensively.
-    """
-    if result is None:
-        return ""
-
-    if isinstance(result, str):
-        return result.strip()
-
-    if isinstance(result, list):
-        # Could be list[str], list[dict], or token ids
-        if not result:
-            return ""
-        if all(isinstance(x, str) for x in result):
-            return "\n".join(result).strip()
-        if isinstance(result[0], dict):
-            # Common chat-like output patterns
-            if "generated_text" in result[0]:
-                return str(result[0].get("generated_text", "")).strip()
-            if "text" in result[0]:
-                return str(result[0].get("text", "")).strip()
-        return str(result).strip()
-
-    if isinstance(result, dict):
-        for key in ("generated_text", "text", "response", "output"):
-            if key in result:
-                return str(result[key]).strip()
-
-    return str(result).strip()
-
-
-def _load_airllm_model(model_name: str):
-    """
-    Lazy import and model load to avoid hard dependency unless provider=airllm.
-    """
-    try:
-        from airllm import AutoModel  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "AirLLM import failed. Install AirLLM and compatible runtime dependencies."
-        ) from e
-
-    kwargs = {}
-    # Best-effort device hinting, only if your AirLLM version supports these args.
-    if AIRLLM_DEVICE in ("cpu", "cuda"):
-        kwargs["device"] = AIRLLM_DEVICE
-
-    try:
-        return AutoModel.from_pretrained(model_name, **kwargs)
-    except TypeError:
-        # Backward/forward compatibility if signature differs
-        return AutoModel.from_pretrained(model_name)
-
-
-def _ensure_airllm_loaded(primary: bool = True):
-    global _AIRLLM_PRIMARY, _AIRLLM_FALLBACK
-    if primary:
-        if _AIRLLM_PRIMARY is None:
-            _AIRLLM_PRIMARY = _load_airllm_model(AIRLLM_MODEL)
-        return _AIRLLM_PRIMARY
-
-    if _AIRLLM_FALLBACK is None:
-        _AIRLLM_FALLBACK = _load_airllm_model(AIRLLM_FALLBACK_MODEL)
-    return _AIRLLM_FALLBACK
-
-
-def _call_airllm(model_name: str, prompt: str) -> str:
-    model = _ensure_airllm_loaded(primary=(model_name == AIRLLM_MODEL))
-
-    # Try several common invocation patterns for compatibility.
-    # 1) model.generate(prompt)
-    if hasattr(model, "generate"):
-        try:
-            out = model.generate(prompt)
-            return _normalize_airllm_output(out)
-        except TypeError:
-            # Some variants expect list[str]
-            out = model.generate([prompt])
-            return _normalize_airllm_output(out)
-
-    # 2) callable model(prompt)
-    if callable(model):
-        out = model(prompt)
-        return _normalize_airllm_output(out)
-
-    raise RuntimeError("AirLLM model object does not support generation methods.")
-
-
-def _call_llm(prompt: str) -> str:
-    provider = LLM_PROVIDER
-
-    if provider == "airllm":
-        answer = _call_airllm(AIRLLM_MODEL, prompt)
-        if (
-            not answer
-            and AIRLLM_FALLBACK_MODEL
-            and AIRLLM_FALLBACK_MODEL != AIRLLM_MODEL
-        ):
-            answer = _call_airllm(AIRLLM_FALLBACK_MODEL, prompt)
-        return answer
-
-    # Default: ollama
-    answer = _call_ollama(MODEL, prompt)
-    if not answer and FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
-        answer = _call_ollama(FALLBACK_MODEL, prompt)
-    return answer
-
-
-# -----------------------------
-# Main answer generation
-# -----------------------------
-def generate_answer(question: str, use_web: bool = True, n_results: int = 5):
+def _build_prompt_and_context(question: str, use_web: bool = True, n_results: int = 5):
     retrieved = query_knowledge(question, n_results=n_results)
 
     relevant_local = [
@@ -300,6 +174,244 @@ Context:
 Question:
 {question}
 """
+    return prompt, context, source
+
+
+# -----------------------------
+# Provider implementations
+# -----------------------------
+def _call_ollama(model: str, prompt: str) -> str:
+    response = HTTP.post(
+        OLLAMA_URL,
+        json={"model": model, "prompt": prompt, "stream": False},
+        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("response", "").strip()
+
+
+def _iter_ollama_stream(model: str, prompt: str):
+    """
+    Yields incremental text chunks from Ollama's streaming endpoint.
+    Ollama returns JSON objects per line; each line contains partial "response"
+    and a final object with "done": true.
+    """
+    response = HTTP.post(
+        OLLAMA_URL,
+        json={"model": model, "prompt": prompt, "stream": True},
+        timeout=(OLLAMA_CONNECT_TIMEOUT, OLLAMA_READ_TIMEOUT),
+        stream=True,
+    )
+    response.raise_for_status()
+
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            # Skip malformed stream lines
+            continue
+
+        chunk = payload.get("response", "")
+        if chunk:
+            yield chunk
+
+        if payload.get("done"):
+            break
+
+
+def _normalize_airllm_output(result) -> str:
+    """
+    AirLLM outputs can vary depending on version/backends.
+    Handle common shapes defensively.
+    """
+    if result is None:
+        return ""
+
+    if isinstance(result, str):
+        return result.strip()
+
+    if isinstance(result, list):
+        if not result:
+            return ""
+        if all(isinstance(x, str) for x in result):
+            return "\n".join(result).strip()
+        if isinstance(result[0], dict):
+            if "generated_text" in result[0]:
+                return str(result[0].get("generated_text", "")).strip()
+            if "text" in result[0]:
+                return str(result[0].get("text", "")).strip()
+        return str(result).strip()
+
+    if isinstance(result, dict):
+        for key in ("generated_text", "text", "response", "output"):
+            if key in result:
+                return str(result[key]).strip()
+
+    return str(result).strip()
+
+
+def _load_airllm_model(model_name: str):
+    """
+    Lazy import and model load to avoid hard dependency unless provider=airllm.
+    """
+    try:
+        from airllm import AutoModel  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "AirLLM import failed. Install AirLLM and compatible runtime dependencies."
+        ) from e
+
+    kwargs = {}
+    if AIRLLM_DEVICE in ("cpu", "cuda"):
+        kwargs["device"] = AIRLLM_DEVICE
+
+    try:
+        return AutoModel.from_pretrained(model_name, **kwargs)
+    except TypeError:
+        return AutoModel.from_pretrained(model_name)
+
+
+def _ensure_airllm_loaded(primary: bool = True):
+    global _AIRLLM_PRIMARY, _AIRLLM_FALLBACK
+    if primary:
+        if _AIRLLM_PRIMARY is None:
+            _AIRLLM_PRIMARY = _load_airllm_model(AIRLLM_MODEL)
+        return _AIRLLM_PRIMARY
+
+    if _AIRLLM_FALLBACK is None:
+        _AIRLLM_FALLBACK = _load_airllm_model(AIRLLM_FALLBACK_MODEL)
+    return _AIRLLM_FALLBACK
+
+
+def _call_airllm(model_name: str, prompt: str) -> str:
+    model = _ensure_airllm_loaded(primary=(model_name == AIRLLM_MODEL))
+
+    if hasattr(model, "generate"):
+        try:
+            out = model.generate(prompt)
+            return _normalize_airllm_output(out)
+        except TypeError:
+            out = model.generate([prompt])
+            return _normalize_airllm_output(out)
+
+    if callable(model):
+        out = model(prompt)
+        return _normalize_airllm_output(out)
+
+    raise RuntimeError("AirLLM model object does not support generation methods.")
+
+
+def _call_llm(prompt: str) -> str:
+    provider = LLM_PROVIDER
+
+    if provider == "airllm":
+        answer = _call_airllm(AIRLLM_MODEL, prompt)
+        if (
+            not answer
+            and AIRLLM_FALLBACK_MODEL
+            and AIRLLM_FALLBACK_MODEL != AIRLLM_MODEL
+        ):
+            answer = _call_airllm(AIRLLM_FALLBACK_MODEL, prompt)
+        return answer
+
+    # Default: ollama
+    answer = _call_ollama(MODEL, prompt)
+    if not answer and FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        answer = _call_ollama(FALLBACK_MODEL, prompt)
+    return answer
+
+
+# -----------------------------
+# SSE streaming helper (Ollama)
+# -----------------------------
+def generate_answer_stream(question: str, use_web: bool = True, n_results: int = 5):
+    """
+    Server-Sent Events generator for streaming answer chunks.
+
+    Event types emitted:
+    - chunk: incremental text
+    - done: final metadata
+    - error: error message
+
+    Note:
+    - True token streaming is implemented for Ollama provider.
+    - Other providers currently emit an error event from this route.
+    """
+    prompt, context, source = _build_prompt_and_context(
+        question=question, use_web=use_web, n_results=n_results
+    )
+
+    if LLM_PROVIDER != "ollama":
+        err = {
+            "error": f"Streaming route currently supports ollama only. provider={LLM_PROVIDER}",
+            "provider": LLM_PROVIDER,
+            "source": source,
+        }
+        yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+        return
+
+    used_model = MODEL
+    produced_any = False
+
+    try:
+        for piece in _iter_ollama_stream(MODEL, prompt):
+            produced_any = True
+            payload = {"text": piece}
+            yield f"event: chunk\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    except requests.RequestException:
+        # try fallback only if primary stream failed before any content
+        if FALLBACK_MODEL and FALLBACK_MODEL != MODEL and not produced_any:
+            used_model = FALLBACK_MODEL
+            try:
+                for piece in _iter_ollama_stream(FALLBACK_MODEL, prompt):
+                    produced_any = True
+                    payload = {"text": piece}
+                    yield f"event: chunk\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                err = {
+                    "error": f"Ollama stream failed on primary and fallback: {e}",
+                    "provider": LLM_PROVIDER,
+                    "source": source,
+                }
+                yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+                return
+        else:
+            err = {
+                "error": "Ollama stream request failed.",
+                "provider": LLM_PROVIDER,
+                "source": source,
+            }
+            yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+            return
+    except Exception as e:
+        err = {
+            "error": f"Streaming failed: {e}",
+            "provider": LLM_PROVIDER,
+            "source": source,
+        }
+        yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+        return
+
+    done_payload = {
+        "provider": LLM_PROVIDER,
+        "source": source,
+        "model": used_model,
+        "context": context,
+    }
+    yield f"event: done\ndata: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
+
+
+# -----------------------------
+# Main answer generation (non-stream)
+# -----------------------------
+def generate_answer(question: str, use_web: bool = True, n_results: int = 5):
+    prompt, context, source = _build_prompt_and_context(
+        question=question, use_web=use_web, n_results=n_results
+    )
 
     try:
         answer = _call_llm(prompt)
@@ -307,7 +419,6 @@ Question:
             answer = "I am unsure based on the available context."
 
     except requests.Timeout:
-        # Applies to Ollama HTTP path
         return {
             "answer": (
                 f"Ollama timed out after connect={OLLAMA_CONNECT_TIMEOUT}s, "
@@ -319,7 +430,6 @@ Question:
             "provider": LLM_PROVIDER,
         }
     except requests.RequestException as e:
-        # Applies to Ollama HTTP path
         return {
             "answer": f"Ollama request failed: {e}",
             "source": source,
@@ -327,7 +437,6 @@ Question:
             "provider": LLM_PROVIDER,
         }
     except ValueError:
-        # Applies to Ollama JSON parsing path
         return {
             "answer": "Ollama returned a non-JSON response.",
             "source": source,
@@ -335,7 +444,6 @@ Question:
             "provider": LLM_PROVIDER,
         }
     except Exception as e:
-        # Includes AirLLM loading/runtime issues
         return {
             "answer": f"LLM provider '{LLM_PROVIDER}' failed: {e}",
             "source": source,
