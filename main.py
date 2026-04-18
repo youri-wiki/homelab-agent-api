@@ -53,9 +53,10 @@ def ask_question_stream(q: Question):
     try:
         from rag import stream_answer_ollama
     except Exception as e:
-
+        err_msg = f"Streaming unavailable: {str(e)}"
+    
         async def import_error_stream():
-            payload = {"message": f"Streaming unavailable: {str(e)}"}
+            payload = {"message": err_msg}
             yield f"event: error\ndata: {json.dumps(payload)}\n\n"
 
         return StreamingResponse(import_error_stream(), media_type="text/event-stream")
