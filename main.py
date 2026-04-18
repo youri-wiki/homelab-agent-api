@@ -1,5 +1,3 @@
-
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -52,7 +50,7 @@ def ask_question_stream(q: Question):
     """
     from rag import generate_answer_stream
   
-      def event_generator():
+    def event_generator():
           # generate_answer_stream already emits SSE-formatted events:
           # event: chunk|done|error
           for sse_event in generate_answer_stream(
@@ -62,13 +60,13 @@ def ask_question_stream(q: Question):
           ):
               yield sse_event
   
-      headers = {
+    headers = {
           "Cache-Control": "no-cache",
           "Connection": "keep-alive",
           "X-Accel-Buffering": "no",
       }
   
-      return StreamingResponse(
+    return StreamingResponse(
           event_generator(),
           media_type="text/event-stream",
           headers=headers,
