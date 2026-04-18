@@ -1,4 +1,4 @@
-import json
+
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,45 +50,29 @@ def ask_question_stream(q: Question):
       event: error
       data: {"message":"..."}
     """
-    try:
-        from rag import stream_answer_ollama
-    except Exception as e:
-        err_msg = f"Streaming unavailable: {str(e)}"
-    
-        async def import_error_stream():
-            payload = {"message": err_msg}
-            yield f"event: error\ndata: {json.dumps(payload)}\n\n"
-
-        return StreamingResponse(import_error_stream(), media_type="text/event-stream")
-
-    async def event_generator():
-        try:
-            for chunk in stream_answer_ollama(
-                q.question,
-                use_web=q.use_web,
-                n_results=q.n_results,
-            ):
-                payload = {"text": chunk}
-                yield f"event: chunk\ndata: {json.dumps(payload)}\n\n"
-
-            yield f"event: done\ndata: {json.dumps({'status': 'completed'})}\n\n"
-
-        except Exception as e:
-            payload = {"message": str(e)}
-            yield f"event: error\ndata: {json.dumps(payload)}\n\n"
-
-    headers = {
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-    }
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers=headers,
-    )
-
+    from rag import generate_answer_stream
+  
+      def event_generator():
+          # generate_answer_stream already emits SSE-formatted events:
+          # event: chunk|done|error
+          for sse_event in generate_answer_stream(
+              q.question,
+              use_web=q.use_web,
+              n_results=q.n_results,
+          ):
+              yield sse_event
+  
+      headers = {
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "X-Accel-Buffering": "no",
+      }
+  
+      return StreamingResponse(
+          event_generator(),
+          media_type="text/event-stream",
+          headers=headers,
+      )
 
 @app.get("/knowledge")
 def list_knowledge():
