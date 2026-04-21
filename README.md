@@ -6,7 +6,7 @@ It stores your local knowledge in ChromaDB, optionally augments with web search,
 
 ---
 
-## Features
+## Features.
 
 - FastAPI REST API
 - Local knowledge storage with ChromaDB
